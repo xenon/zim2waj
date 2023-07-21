@@ -6,6 +6,7 @@ use jbk::creator::schema;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use zim_rs::archive::Archive;
 
 #[derive(Parser)]
@@ -23,6 +24,113 @@ struct Cli {
 
 const VENDOR_ID: u32 = 0x6a_69_6d_00;
 
+#[derive(Clone)]
+struct ProgressBar {
+    pub comp_clusters: indicatif::ProgressBar,
+    pub uncomp_clusters: indicatif::ProgressBar,
+    pub entries: indicatif::ProgressBar,
+    pub size: indicatif::ProgressBar,
+}
+
+impl ProgressBar {
+    fn gather_information(zim: &Archive) -> jbk::Result<(u32, u64)> {
+        let mut size = 0;
+        let style = indicatif::ProgressStyle::with_template(
+            "{prefix} : [{wide_bar:.cyan/blue}] {pos:7} / {len:7}",
+        )
+        .unwrap()
+        .progress_chars("#+- ");
+        let pb = indicatif::ProgressBar::new(zim.get_all_entrycount() as u64)
+            .with_style(style)
+            .with_prefix("Gather information");
+        let iter = zim.iter_efficient().unwrap();
+        for entry in pb.wrap_iter(iter.into_iter()) {
+            let entry = entry.unwrap();
+            let path = entry.get_path();
+            match &path[0..1] {
+                "-" | "A" | "C" | "J" | "I" => {
+                    if !entry.is_redirect() {
+                        size += entry.get_item(false).unwrap().get_size();
+                    }
+                }
+                _ => {
+                    //println!("Skip {}", path);
+                }
+            }
+        }
+        Ok((zim.get_all_entrycount(), size))
+    }
+
+    fn new(zim: &Archive) -> jbk::Result<Self> {
+        let draw_target = indicatif::ProgressDrawTarget::stdout_with_hz(1);
+        let style = indicatif::ProgressStyle::with_template(
+            "{prefix} : [{wide_bar:.cyan/blue}] {pos:7} / {len:7}",
+        )
+        .unwrap()
+        .progress_chars("#+- ");
+
+        let multi = indicatif::MultiProgress::with_draw_target(draw_target);
+
+        let (nb_entries, size) = Self::gather_information(zim)?;
+
+        let comp_clusters = indicatif::ProgressBar::new(0)
+            .with_style(style.clone())
+            .with_prefix("Compressed Cluster  ");
+
+        let uncomp_clusters = indicatif::ProgressBar::new(0)
+            .with_style(style.clone())
+            .with_prefix("Uncompressed Cluster");
+
+        let entries_style = style
+            .clone()
+            .template("{elapsed} / {duration} : [{wide_bar:.cyan/blue}] {pos:7} / {len:7}")
+            .unwrap();
+        let entries = indicatif::ProgressBar::new(nb_entries as u64).with_style(entries_style);
+
+        let bytes_style = style
+            .clone()
+            .template(
+                "{elapsed} / {duration} : [{wide_bar:.cyan/blue}] {bytes:7} / {total_bytes:7}",
+            )
+            .unwrap();
+        let size = indicatif::ProgressBar::new(size)
+            .with_style(bytes_style)
+            .with_prefix("Size");
+        multi.add(entries.clone());
+        multi.add(size.clone());
+        multi.add(comp_clusters.clone());
+        multi.add(uncomp_clusters.clone());
+        Ok(Self {
+            entries,
+            comp_clusters,
+            uncomp_clusters,
+            size,
+        })
+    }
+}
+
+impl jbk::creator::Progress for ProgressBar {
+    fn new_cluster(&self, _cluster_idx: u32, compressed: bool) {
+        if compressed {
+            &self.comp_clusters
+        } else {
+            &self.uncomp_clusters
+        }
+        .inc_length(1)
+    }
+    fn handle_cluster(&self, _cluster_idx: u32, compressed: bool) {
+        if compressed {
+            &self.comp_clusters
+        } else {
+            &self.uncomp_clusters
+        }
+        .inc(1)
+    }
+    fn content_added(&self, size: jbk::Size) {
+        self.size.inc(size.into_u64())
+    }
+}
+
 pub struct Converter {
     content_pack: jbk::creator::ContentPackCreator,
     directory_pack: jbk::creator::DirectoryPackCreator,
@@ -30,6 +138,7 @@ pub struct Converter {
     entry_count: jbk::EntryCount,
     main_entry_id: Option<jbk::Bound<jbk::EntryIdx>>,
     zim: Archive,
+    progress: Arc<ProgressBar>,
 }
 
 impl Converter {
@@ -41,12 +150,14 @@ impl Converter {
         let mut content_pack_path = PathBuf::new();
         content_pack_path.push(outfile);
         content_pack_path.set_file_name(outfilename);
-        let content_pack = jbk::creator::ContentPackCreator::new(
+        let progress = Arc::new(ProgressBar::new(&zim)?);
+        let content_pack = jbk::creator::ContentPackCreator::new_with_progress(
             content_pack_path,
             jbk::PackId::from(1),
             VENDOR_ID,
             jbk::FreeData40::clone_from_slice(&[0x00; 40]),
             jbk::CompressionType::Zstd,
+            Arc::clone(&progress) as Arc<dyn jbk::creator::Progress>,
         )?;
 
         outfilename = outfile.file_name().unwrap().to_os_string();
@@ -92,6 +203,7 @@ impl Converter {
             zim,
             entry_count: 0.into(),
             main_entry_id: None,
+            progress,
         })
     }
 
@@ -113,8 +225,8 @@ impl Converter {
             jubako::EntryCount::from(1),
             self.main_entry_id.unwrap().into(),
         );
-        let directory_pack_info = self.directory_pack.finalize()?;
-        let content_pack_info = self.content_pack.finalize()?;
+        let directory_pack_info = self.directory_pack.finalize(None)?;
+        let content_pack_info = self.content_pack.finalize(None)?;
         let mut manifest_creator = jbk::creator::ManifestPackCreator::new(
             outfile,
             VENDOR_ID,
@@ -133,35 +245,30 @@ impl Converter {
             self.zim.get_all_entrycount()
         );
         let main_page = self.zim.get_mainentry().unwrap();
-        println!("Main page is {}", main_page.get_path());
-        let main_id = main_page.get_index();
-        println!("Main id is {main_id}");
+        let main_id = main_page.get_item(true).unwrap().get_index();
+        println!("Main page is {} ({})", main_page.get_title(), main_id);
         let iter = self.zim.iter_efficient().unwrap();
+        let filter = if self.zim.has_new_namespace_scheme() {
+            |_p: &str| true
+        } else {
+            |p: &str| match &p[0..1] {
+                "-" | "A" | "C" | "J" | "I" => true,
+                _ => false,
+            }
+        };
         for entry in iter {
             let entry = entry.unwrap();
             let path = entry.get_path();
-            match &path[0..1] {
-                "-" | "A" | "C" | "J" | "I" => {
-                    let is_main_entry = main_id == entry.get_index();
-                    self.handle(entry, is_main_entry)?;
-                }
-                _ => {
-                    println!("Skip {}", path);
-                }
+            if filter(&path) {
+                let is_main_entry = main_id == entry.get_index();
+                self.handle(entry, is_main_entry)?;
             }
         }
         self.finalize(outfile)
     }
 
     fn handle(&mut self, entry: zim_rs::entry::Entry, is_main_entry: bool) -> jbk::Result<()> {
-        if self.entry_count.into_u32() % 1000 == 0 {
-            println!("{} {:?}", self.entry_count, entry.get_path());
-        }
-
-        if entry.get_path() == "I/Postomat-Windows-p1020441.jpg.webp" {
-            println!("======================================================================");
-            println!("Entry is {}", entry.get_path());
-        }
+        self.progress.entries.inc(1);
 
         let entry_idx = jbk::Vow::new(jbk::EntryIdx::from(0));
         let entry_idx_bind = entry_idx.bind();

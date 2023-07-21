@@ -7,5 +7,6 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.0.32", features = ["derive"] }
+indicatif = "0.17.3"
 jubako = "0.1.0"
 zim-rs = { path = "../zim-rs" }
