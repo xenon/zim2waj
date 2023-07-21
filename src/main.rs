@@ -10,7 +10,7 @@ use std::sync::Arc;
 use zim_rs::archive::Archive;
 
 #[derive(Parser)]
-#[clap(name = "zim2jim")]
+#[clap(name = "zim2waj")]
 #[clap(author, version, about, long_about=None)]
 struct Cli {
     // Input
@@ -146,7 +146,7 @@ impl Converter {
         let zim = Archive::new(infile.as_ref().to_str().unwrap()).unwrap();
         let outfile = outfile.as_ref();
         let mut outfilename: OsString = outfile.file_name().unwrap().to_os_string();
-        outfilename.push(".jimc");
+        outfilename.push(".wajc");
         let mut content_pack_path = PathBuf::new();
         content_pack_path.push(outfile);
         content_pack_path.set_file_name(outfilename);
@@ -161,7 +161,7 @@ impl Converter {
         )?;
 
         outfilename = outfile.file_name().unwrap().to_os_string();
-        outfilename.push(".jimd");
+        outfilename.push(".wajd");
         let mut directory_pack_path = PathBuf::new();
         directory_pack_path.push(outfile);
         directory_pack_path.set_file_name(outfilename);
@@ -210,7 +210,7 @@ impl Converter {
     fn finalize(mut self, outfile: PathBuf) -> jbk::Result<()> {
         let entry_store_id = self.directory_pack.add_entry_store(self.entry_store);
         self.directory_pack.create_index(
-            "jim_entries",
+            "waj_entries",
             jubako::ContentAddress::new(0.into(), 0.into()),
             jbk::PropertyIdx::from(0),
             entry_store_id,
@@ -218,7 +218,7 @@ impl Converter {
             jubako::EntryIdx::from(0).into(),
         );
         self.directory_pack.create_index(
-            "jim_main",
+            "waj_main",
             jubako::ContentAddress::new(0.into(), 0.into()),
             jbk::PropertyIdx::from(0),
             entry_store_id,
