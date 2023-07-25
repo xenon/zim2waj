@@ -2,11 +2,14 @@ use jubako as jbk;
 
 use clap::Parser;
 
-use jbk::creator::schema;
+use mime_guess::{mime, Mime};
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
+use waj::create::Adder;
 use zim_rs::archive::Archive;
 
 #[derive(Parser)]
@@ -23,6 +26,12 @@ struct Cli {
 }
 
 const VENDOR_ID: u32 = 0x6a_69_6d_00;
+
+pub enum ConcatMode {
+    OneFile,
+    TwoFiles,
+    NoConcat,
+}
 
 #[derive(Clone)]
 struct ProgressBar {
@@ -131,28 +140,112 @@ impl jbk::creator::Progress for ProgressBar {
     }
 }
 
+pub struct ContentAdder {
+    content_pack: jbk::creator::CachedContentPackCreator,
+}
+
+impl ContentAdder {
+    fn new(content_pack: jbk::creator::CachedContentPackCreator) -> Self {
+        Self { content_pack }
+    }
+
+    fn into_inner(self) -> jbk::creator::CachedContentPackCreator {
+        self.content_pack
+    }
+}
+
+impl waj::create::Adder for ContentAdder {
+    fn add(&mut self, reader: jbk::Reader) -> jbk::Result<jbk::ContentAddress> {
+        let content_id = self.content_pack.add_content(reader)?;
+        Ok(jbk::ContentAddress::new(1.into(), content_id))
+    }
+}
+
 pub struct Converter {
-    content_pack: jbk::creator::ContentPackCreator,
+    adder: ContentAdder,
     directory_pack: jbk::creator::DirectoryPackCreator,
-    entry_store: Box<jbk::creator::EntryStore<Box<jbk::creator::BasicEntry>>>,
-    entry_count: jbk::EntryCount,
-    main_entry_id: Option<jbk::Bound<jbk::EntryIdx>>,
+    entry_store_creator: waj::create::EntryStoreCreator,
     zim: Archive,
+    concat_mode: ConcatMode,
+    tmp_path_content_pack: tempfile::TempPath,
+    tmp_path_directory_pack: tempfile::TempPath,
     progress: Arc<ProgressBar>,
 }
 
+enum ZimEntryKind {
+    Redirect(OsString),
+    Content(jbk::ContentAddress, Mime),
+}
+
+struct ZimEntry {
+    path: OsString,
+    data: ZimEntryKind,
+}
+
+impl ZimEntry {
+    pub fn new(entry: zim_rs::entry::Entry, adder: &mut ContentAdder) -> jbk::Result<Self> {
+        Ok(if entry.is_redirect() {
+            Self {
+                path: entry.get_path().into(),
+                data: ZimEntryKind::Redirect(entry.get_redirect_entry().unwrap().get_path().into()),
+            }
+        } else {
+            let item = entry.get_item(false).unwrap();
+            let item_size = item.get_size();
+            let item_mimetype = item.get_mimetype().unwrap();
+            let blob_reader = jbk::creator::Reader::new(
+                item.get_data().unwrap(),
+                jbk::End::Size(item_size.into()),
+            );
+            let content_address = adder.add(blob_reader)?;
+            Self {
+                path: entry.get_path().into(),
+                data: ZimEntryKind::Content(
+                    content_address,
+                    Mime::from_str(&item_mimetype).unwrap_or_else(|_e| {
+                        println!(
+                            "{} is not a valid mime type. Using mime::OCTET_STREAM",
+                            &item_mimetype
+                        );
+                        mime::OCTET_STREAM
+                    }),
+                ),
+            }
+        })
+    }
+}
+
+impl waj::create::EntryTrait for ZimEntry {
+    fn kind(&self) -> jbk::Result<Option<waj::create::EntryKind>> {
+        Ok(Some(match &self.data {
+            ZimEntryKind::Redirect(target) => waj::create::EntryKind::Redirect(target.clone()),
+            ZimEntryKind::Content(content_address, mime) => {
+                waj::create::EntryKind::Content(*content_address, mime.clone())
+            }
+        }))
+    }
+
+    fn name(&self) -> &OsStr {
+        &self.path
+    }
+}
+
 impl Converter {
-    pub fn new<P: AsRef<Path>>(infile: P, outfile: P) -> jbk::Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        infile: P,
+        outfile: P,
+        concat_mode: ConcatMode,
+    ) -> jbk::Result<Self> {
         let zim = Archive::new(infile.as_ref().to_str().unwrap()).unwrap();
         let outfile = outfile.as_ref();
-        let mut outfilename: OsString = outfile.file_name().unwrap().to_os_string();
-        outfilename.push(".wajc");
-        let mut content_pack_path = PathBuf::new();
-        content_pack_path.push(outfile);
-        content_pack_path.set_file_name(outfilename);
+        let out_dir = outfile.parent().unwrap();
+
         let progress = Arc::new(ProgressBar::new(&zim)?);
-        let content_pack = jbk::creator::ContentPackCreator::new_with_progress(
-            content_pack_path,
+
+        let (tmp_content_pack, tmp_path_content_pack) =
+            tempfile::NamedTempFile::new_in(out_dir)?.into_parts();
+        let content_pack = jbk::creator::ContentPackCreator::new_from_file_with_progress(
+            tmp_content_pack,
             jbk::PackId::from(1),
             VENDOR_ID,
             jbk::FreeData40::clone_from_slice(&[0x00; 40]),
@@ -160,73 +253,76 @@ impl Converter {
             Arc::clone(&progress) as Arc<dyn jbk::creator::Progress>,
         )?;
 
-        outfilename = outfile.file_name().unwrap().to_os_string();
-        outfilename.push(".wajd");
-        let mut directory_pack_path = PathBuf::new();
-        directory_pack_path.push(outfile);
-        directory_pack_path.set_file_name(outfilename);
-        let mut directory_pack = jbk::creator::DirectoryPackCreator::new(
-            directory_pack_path,
+        let (_, tmp_path_directory_pack) = tempfile::NamedTempFile::new_in(out_dir)?.into_parts();
+        let directory_pack = jbk::creator::DirectoryPackCreator::new(
+            &tmp_path_directory_pack,
             jbk::PackId::from(0),
             VENDOR_ID,
             jbk::FreeData31::clone_from_slice(&[0x00; 31]),
         );
 
-        let path_store = directory_pack.create_value_store(jbk::creator::ValueStoreKind::Plain);
-        let mime_store = directory_pack.create_value_store(jbk::creator::ValueStoreKind::Indexed);
+        let main_page = zim.get_mainentry().unwrap();
+        let main_path = main_page.get_item(true).unwrap().get_path();
+        println!("Main page is {}", main_path);
 
-        let schema = schema::Schema::new(
-            // Common part
-            schema::CommonProperties::new(vec![
-                schema::Property::new_array(1, Rc::clone(&path_store)), // the path
-            ]),
-            vec![
-                // Content
-                schema::VariantProperties::new(vec![
-                    schema::Property::new_array(0, Rc::clone(&mime_store)), // the mimetype
-                    schema::Property::new_content_address(),
-                ]),
-                // Redirect
-                schema::VariantProperties::new(vec![
-                    schema::Property::new_array(1, Rc::clone(&path_store)), // Id of the linked entry
-                ]),
-            ],
-            Some(vec![0.into()]),
-        );
-
-        let entry_store = Box::new(jbk::creator::EntryStore::new(schema));
+        let entry_store_creator = waj::create::EntryStoreCreator::new(main_path.into());
 
         Ok(Self {
-            content_pack,
+            adder: ContentAdder::new(jbk::creator::CachedContentPackCreator::new(
+                content_pack,
+                Rc::new(()),
+            )),
             directory_pack,
-            entry_store,
+            entry_store_creator,
             zim,
-            entry_count: 0.into(),
-            main_entry_id: None,
+            concat_mode,
             progress,
+            tmp_path_content_pack,
+            tmp_path_directory_pack,
         })
     }
 
     fn finalize(mut self, outfile: PathBuf) -> jbk::Result<()> {
-        let entry_store_id = self.directory_pack.add_entry_store(self.entry_store);
-        self.directory_pack.create_index(
-            "waj_entries",
-            jubako::ContentAddress::new(0.into(), 0.into()),
-            jbk::PropertyIdx::from(0),
-            entry_store_id,
-            self.entry_count,
-            jubako::EntryIdx::from(0).into(),
-        );
-        self.directory_pack.create_index(
-            "waj_main",
-            jubako::ContentAddress::new(0.into(), 0.into()),
-            jbk::PropertyIdx::from(0),
-            entry_store_id,
-            jubako::EntryCount::from(1),
-            self.main_entry_id.unwrap().into(),
-        );
-        let directory_pack_info = self.directory_pack.finalize(None)?;
-        let content_pack_info = self.content_pack.finalize(None)?;
+        self.entry_store_creator
+            .finalize(&mut self.directory_pack)?;
+
+        let directory_pack_info = match self.concat_mode {
+            ConcatMode::NoConcat => {
+                let mut outfilename = outfile.file_name().unwrap().to_os_string();
+                outfilename.push(".jbkd");
+                let mut directory_pack_path = PathBuf::new();
+                directory_pack_path.push(&outfile);
+                directory_pack_path.set_file_name(outfilename);
+                let directory_pack_info = self
+                    .directory_pack
+                    .finalize(Some(directory_pack_path.clone()))?;
+                if let Err(e) = self.tmp_path_directory_pack.persist(&directory_pack_path) {
+                    return Err(e.error.into());
+                };
+                directory_pack_info
+            }
+            _ => self.directory_pack.finalize(None)?,
+        };
+
+        let content_pack_info = match self.concat_mode {
+            ConcatMode::OneFile => self.adder.into_inner().into_inner().finalize(None)?,
+            _ => {
+                let mut outfilename = outfile.file_name().unwrap().to_os_string();
+                outfilename.push(".jbkc");
+                let mut content_pack_path = PathBuf::new();
+                content_pack_path.push(&outfile);
+                content_pack_path.set_file_name(outfilename);
+                let content_pack_info = self
+                    .adder
+                    .into_inner()
+                    .into_inner()
+                    .finalize(Some(content_pack_path.clone()))?;
+                if let Err(e) = self.tmp_path_content_pack.persist(&content_pack_path) {
+                    return Err(e.error.into());
+                }
+                content_pack_info
+            }
+        };
         let mut manifest_creator = jbk::creator::ManifestPackCreator::new(
             outfile,
             VENDOR_ID,
@@ -244,9 +340,7 @@ impl Converter {
             "Converting zim file with {} entries",
             self.zim.get_all_entrycount()
         );
-        let main_page = self.zim.get_mainentry().unwrap();
-        let main_id = main_page.get_item(true).unwrap().get_index();
-        println!("Main page is {} ({})", main_page.get_title(), main_id);
+
         let iter = self.zim.iter_efficient().unwrap();
         let filter = if self.zim.has_new_namespace_scheme() {
             |_p: &str| true
@@ -258,75 +352,24 @@ impl Converter {
         };
         for entry in iter {
             let entry = entry.unwrap();
-            let path = entry.get_path();
-            if filter(&path) {
-                let is_main_entry = main_id == entry.get_index();
-                self.handle(entry, is_main_entry)?;
+            if filter(&entry.get_path()) {
+                self.handle(entry)?;
             }
         }
         self.finalize(outfile)
     }
 
-    fn handle(&mut self, entry: zim_rs::entry::Entry, is_main_entry: bool) -> jbk::Result<()> {
+    fn handle(&mut self, entry: zim_rs::entry::Entry) -> jbk::Result<()> {
         self.progress.entries.inc(1);
 
-        let entry_idx = jbk::Vow::new(jbk::EntryIdx::from(0));
-        let entry_idx_bind = entry_idx.bind();
-        let entry = Box::new(if entry.is_redirect() {
-            let mut entry_path = entry.get_path().into_bytes();
-            entry_path.truncate(255);
-            let entry_path = jbk::Value::Array(entry_path);
-
-            let redirect_entry = entry.get_redirect_entry().unwrap();
-            let mut target_path = redirect_entry.get_path().into_bytes();
-            target_path.truncate(255);
-            let target_path = jbk::Value::Array(target_path);
-
-            jbk::creator::BasicEntry::new_from_schema_idx(
-                &self.entry_store.schema,
-                entry_idx,
-                Some(1.into()),
-                vec![entry_path, target_path],
-            )
-        } else {
-            let mut entry_path = entry.get_path().into_bytes();
-            entry_path.truncate(255);
-            let entry_path = jbk::Value::Array(entry_path);
-
-            let item = entry.get_item(false).unwrap();
-            let item_size = item.get_size();
-            let item_mimetype = item.get_mimetype().unwrap();
-            let blob_reader = jbk::creator::Reader::new(
-                item.get_data().unwrap(),
-                jbk::End::Size(item_size.into()),
-            );
-            let content_id = self.content_pack.add_content(blob_reader)?;
-
-            jbk::creator::BasicEntry::new_from_schema_idx(
-                &self.entry_store.schema,
-                entry_idx,
-                Some(0.into()),
-                vec![
-                    entry_path,
-                    jbk::Value::Array(item_mimetype.into()),
-                    jbk::Value::Content(jbk::ContentAddress::new(jbk::PackId::from(1), content_id)),
-                ],
-            )
-        });
-
-        if is_main_entry {
-            self.main_entry_id = Some(entry_idx_bind);
-        }
-
-        self.entry_store.add_entry(entry);
-        self.entry_count += 1;
-        Ok(())
+        let entry = ZimEntry::new(entry, &mut self.adder)?;
+        self.entry_store_creator.add_entry(&entry)
     }
 }
 
 fn main() -> jbk::Result<()> {
     let args = Cli::parse();
 
-    let converter = Converter::new(&args.zim_file, &args.outfile)?;
+    let converter = Converter::new(&args.zim_file, &args.outfile, ConcatMode::OneFile)?;
     converter.run(args.outfile)
 }

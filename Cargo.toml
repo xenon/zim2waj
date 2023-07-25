@@ -10,3 +10,6 @@ clap = { version = "4.0.32", features = ["derive"] }
 indicatif = "0.17.3"
 jubako = "0.1.0"
 zim-rs = { path = "../zim-rs" }
+waj = { git = "https://framagit.org/jubako/waj.git", package="libwaj" }
+tempfile = "3.7.0"
+mime_guess = "2.0.4"
