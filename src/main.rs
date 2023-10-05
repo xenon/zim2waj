@@ -2,6 +2,7 @@ use jubako as jbk;
 
 use clap::Parser;
 
+use indicatif_log_bridge::LogWrapper;
 use mime_guess::{mime, Mime};
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -49,6 +50,13 @@ impl ProgressBar {
     }
 
     fn new(zim: &Archive) -> jbk::Result<Self> {
+        let env = env_logger::Env::default()
+            .filter("WAJ_LOG")
+            .write_style("WAJ_LOG_STYLE");
+        let logger = env_logger::Builder::from_env(env)
+            .format_module_path(false)
+            .format_timestamp(None)
+            .build();
         let draw_target = indicatif::ProgressDrawTarget::stdout_with_hz(1);
         let style = indicatif::ProgressStyle::with_template(
             "{prefix} : [{wide_bar:.cyan/blue}] {pos:7} / {len:7}",
@@ -87,6 +95,7 @@ impl ProgressBar {
         multi.add(size.clone());
         multi.add(comp_clusters.clone());
         multi.add(uncomp_clusters.clone());
+        LogWrapper::new(multi.clone(), logger).try_init().unwrap();
         Ok(Self {
             entries,
             comp_clusters,

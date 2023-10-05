@@ -13,4 +13,6 @@ zim-rs = { path = "../zim-rs" }
 waj = { git = "https://framagit.org/jubako/waj.git", package="libwaj" }
 tempfile = "3.7.0"
 mime_guess = "2.0.4"
+env_logger = "0.10.0"
+indicatif-log-bridge = "0.2.2"
 log = "0.4.20"
