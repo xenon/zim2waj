@@ -42,6 +42,7 @@ pub enum ConcatMode {
 struct ProgressBar {
     pub comp_clusters: indicatif::ProgressBar,
     pub uncomp_clusters: indicatif::ProgressBar,
+    pub written_clusters: indicatif::ProgressBar,
     pub entries: indicatif::ProgressBar,
     pub size: indicatif::ProgressBar,
 }
@@ -59,14 +60,11 @@ impl ProgressBar {
             .format_module_path(false)
             .format_timestamp(None)
             .build();
+
         let draw_target = indicatif::ProgressDrawTarget::stdout_with_hz(1);
-        let style = indicatif::ProgressStyle::with_template(
-            "{prefix} : [{wide_bar:.cyan/blue}] {pos:7} / {len:7}",
-        )
-        .unwrap()
-        .progress_chars("#+- ");
 
         let multi = indicatif::MultiProgress::with_draw_target(draw_target);
+        multi.set_move_cursor(true);
 
         let nb_entries = Self::gather_information(zim);
 
@@ -78,30 +76,45 @@ impl ProgressBar {
             .with_style(bytes_style)
             .with_prefix("Processed size");
         multi.add(size.clone());
+
+        let cluster_style =
+            indicatif::ProgressStyle::with_template("{prefix} : {human_pos} ({human_len})")
+                .unwrap();
         let comp_clusters = indicatif::ProgressBar::new(0)
-            .with_style(style.clone())
-            .with_prefix("Compressed Cluster  ");
+            .with_style(cluster_style.clone())
+            .with_prefix("Compressed Cluster");
 
         let uncomp_clusters = indicatif::ProgressBar::new(0)
-            .with_style(style.clone())
+            .with_style(cluster_style.clone())
             .with_prefix("Uncompressed Cluster");
 
-        let entries_style = style
-            .clone()
-            .template("{elapsed} / {duration} : [{wide_bar:.cyan/blue}] {pos:7} / {len:7}")
-            .unwrap();
-        let entries = indicatif::ProgressBar::new(nb_entries as u64).with_style(entries_style);
-
-            )
-        multi.add(entries.clone());
-        multi.add(size.clone());
+        let written_clusters = indicatif::ProgressBar::new(0)
+            .with_style(cluster_style.clone())
+            .with_prefix("Written clusters");
         multi.add(comp_clusters.clone());
         multi.add(uncomp_clusters.clone());
+        multi.add(written_clusters.clone());
+
+        let entries_style = indicatif::ProgressStyle::with_template(
+                "{prefix} : {elapsed} / {duration} : [{wide_bar:.cyan/blue}] {human_pos:10} / {human_len:10}"
+            )
+            .unwrap()
+            .progress_chars("#+- ");
+        let entries = indicatif::ProgressBar::new(nb_entries as u64)
+            .with_style(entries_style)
+            .with_prefix("Processed entries");
+        multi.add(entries.clone());
+
+        comp_clusters.tick();
+        uncomp_clusters.tick();
+        written_clusters.tick();
+
         LogWrapper::new(multi.clone(), logger).try_init().unwrap();
         Ok(Self {
             entries,
             comp_clusters,
             uncomp_clusters,
+            written_clusters,
             size,
         })
     }
@@ -116,6 +129,7 @@ impl jbk::creator::Progress for ProgressBar {
         }
         .inc_length(1)
     }
+
     fn handle_cluster(&self, _cluster_idx: u32, compressed: bool) {
         if compressed {
             &self.comp_clusters
@@ -124,6 +138,11 @@ impl jbk::creator::Progress for ProgressBar {
         }
         .inc(1)
     }
+
+    fn handle_cluster_written(&self, _cluster_idx: u32) {
+        self.written_clusters.inc(1)
+    }
+
     fn content_added(&self, size: jbk::Size) {
         self.size.inc(size.into_u64())
     }
