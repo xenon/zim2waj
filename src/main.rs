@@ -12,6 +12,8 @@ use std::sync::Arc;
 use waj::create::Adder;
 use zim_rs::archive::Archive;
 
+use log::info;
+
 #[derive(Parser)]
 #[clap(name = "zim2waj")]
 #[clap(author, version, about, long_about=None)]
@@ -239,7 +241,7 @@ impl Converter {
 
         let main_page = zim.get_mainentry().unwrap();
         let main_path = main_page.get_item(true).unwrap().get_path();
-        println!("Main page is {}", main_path);
+        info!("Main page is {}", main_path);
 
         let entry_store_creator = waj::create::EntryStoreCreator::new(main_path.into());
 
@@ -312,7 +314,7 @@ impl Converter {
     }
 
     pub fn run(mut self, outfile: PathBuf) -> jbk::Result<()> {
-        println!(
+        info!(
             "Converting zim file with {} entries",
             self.zim.get_all_entrycount()
         );
