@@ -42,32 +42,8 @@ struct ProgressBar {
 }
 
 impl ProgressBar {
-    fn gather_information(zim: &Archive) -> jbk::Result<(u32, u64)> {
-        let mut size = 0;
-        let style = indicatif::ProgressStyle::with_template(
-            "{prefix} : [{wide_bar:.cyan/blue}] {pos:7} / {len:7}",
-        )
-        .unwrap()
-        .progress_chars("#+- ");
-        let pb = indicatif::ProgressBar::new(zim.get_all_entrycount() as u64)
-            .with_style(style)
-            .with_prefix("Gather information");
-        let iter = zim.iter_efficient().unwrap();
-        for entry in pb.wrap_iter(iter.into_iter()) {
-            let entry = entry.unwrap();
-            let path = entry.get_path();
-            match &path[0..1] {
-                "-" | "A" | "C" | "J" | "I" => {
-                    if !entry.is_redirect() {
-                        size += entry.get_item(false).unwrap().get_size();
-                    }
-                }
-                _ => {
-                    //println!("Skip {}", path);
-                }
-            }
-        }
-        Ok((zim.get_all_entrycount(), size))
+    fn gather_information(zim: &Archive) -> u32 {
+        zim.get_all_entrycount()
     }
 
     fn new(zim: &Archive) -> jbk::Result<Self> {
@@ -80,8 +56,16 @@ impl ProgressBar {
 
         let multi = indicatif::MultiProgress::with_draw_target(draw_target);
 
-        let (nb_entries, size) = Self::gather_information(zim)?;
+        let nb_entries = Self::gather_information(zim);
 
+        let bytes_style = indicatif::ProgressStyle::with_template(
+            "{prefix} : {bytes:7} ({binary_bytes_per_sec})",
+        )
+        .unwrap();
+        let size = indicatif::ProgressBar::new_spinner()
+            .with_style(bytes_style)
+            .with_prefix("Processed size");
+        multi.add(size.clone());
         let comp_clusters = indicatif::ProgressBar::new(0)
             .with_style(style.clone())
             .with_prefix("Compressed Cluster  ");
@@ -96,15 +80,7 @@ impl ProgressBar {
             .unwrap();
         let entries = indicatif::ProgressBar::new(nb_entries as u64).with_style(entries_style);
 
-        let bytes_style = style
-            .clone()
-            .template(
-                "{elapsed} / {duration} : [{wide_bar:.cyan/blue}] {bytes:7} / {total_bytes:7}",
             )
-            .unwrap();
-        let size = indicatif::ProgressBar::new(size)
-            .with_style(bytes_style)
-            .with_prefix("Size");
         multi.add(entries.clone());
         multi.add(size.clone());
         multi.add(comp_clusters.clone());
