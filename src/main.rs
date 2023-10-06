@@ -394,12 +394,12 @@ impl Converter {
             }
         };
 
-        let tmpfile = tempfile::NamedTempFile::new_in(&self.out_dir)?;
-        let (mut tmpfile, tmpname) = tmpfile.into_parts();
-        let directory_pack_info = self.directory_pack.finalize(&mut tmpfile)?;
-
-        let directory_locator = match self.concat_mode {
+        let (directory_pack_info, directory_locator) = match self.concat_mode {
             ConcatMode::NoConcat => {
+                let (mut tmpfile, tmpname) =
+                    tempfile::NamedTempFile::new_in(&self.out_dir)?.into_parts();
+                let directory_pack_info = self.directory_pack.finalize(&mut tmpfile)?;
+
                 let mut outfilename = outfile.file_name().unwrap().to_os_string();
                 outfilename.push(".jbkd");
                 let mut directory_pack_path = PathBuf::new();
@@ -409,15 +409,13 @@ impl Converter {
                 if let Err(e) = tmpname.persist(directory_pack_path) {
                     return Err(e.error.into());
                 };
-                outfilename.into_vec()
+                (directory_pack_info, outfilename.into_vec())
             }
             _ => {
-                tmpfile.rewind()?;
-                container
-                    .as_mut()
-                    .unwrap()
-                    .add_pack(directory_pack_info.uuid, &mut tmpfile)?;
-                vec![]
+                let mut infile = container.unwrap().into_file()?;
+                let directory_pack_info = self.directory_pack.finalize(&mut infile)?;
+                container = Some(infile.close(directory_pack_info.uuid)?);
+                (directory_pack_info, vec![])
             }
         };
 
@@ -427,26 +425,27 @@ impl Converter {
         manifest_creator.add_pack(directory_pack_info, directory_locator);
         manifest_creator.add_pack(content_pack_info, content_locator);
 
-        let tmpfile = tempfile::NamedTempFile::new_in(self.out_dir)?;
-        let (mut tmpfile, tmpname) = tmpfile.into_parts();
-        let manifest_uuid = manifest_creator.finalize(&mut tmpfile)?;
-
         match self.concat_mode {
             ConcatMode::NoConcat => {
+                let (mut tmpfile, tmpname) =
+                    tempfile::NamedTempFile::new_in(self.out_dir)?.into_parts();
+                manifest_creator.finalize(&mut tmpfile)?;
+
                 if let Err(e) = tmpname.persist(outfile) {
                     return Err(e.error.into());
                 };
             }
             _ => {
-                tmpfile.rewind()?;
-                container
-                    .as_mut()
-                    .unwrap()
-                    .add_pack(manifest_uuid, &mut tmpfile)?;
-                container.unwrap().finalize()?;
+                let mut infile = container.unwrap().into_file()?;
+                let manifest_uuid = manifest_creator.finalize(&mut infile)?;
+                container = Some(infile.close(manifest_uuid)?);
             }
         };
-        Ok(())
+        if let Some(container) = container {
+            container.finalize()
+        } else {
+            Ok(())
+        }
     }
 
     pub fn run(mut self, zim: &Archive, outfile: PathBuf) -> jbk::Result<()> {
