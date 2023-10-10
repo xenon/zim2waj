@@ -226,6 +226,7 @@ pub struct Converter {
     tmp_path_content_pack: tempfile::TempPath,
     out_dir: PathBuf,
     progress: Arc<ProgressBar>,
+    main_page_id: u32,
 }
 
 enum ZimEntryKind {
@@ -236,10 +237,15 @@ enum ZimEntryKind {
 struct ZimEntry {
     path: OsString,
     data: ZimEntryKind,
+    is_main_entry: bool,
 }
 
 impl ZimEntry {
-    pub fn new<O>(entry: zim_rs::entry::Entry, adder: &mut ContentAdder<O>) -> jbk::Result<Self>
+    pub fn new<O>(
+        entry: zim_rs::entry::Entry,
+        is_main_entry: bool,
+        adder: &mut ContentAdder<O>,
+    ) -> jbk::Result<Self>
     where
         O: OutStream + 'static,
     {
@@ -249,6 +255,7 @@ impl ZimEntry {
             Self {
                 path: path.into(),
                 data: ZimEntryKind::Redirect(entry.get_redirect_entry().unwrap().get_path().into()),
+                is_main_entry,
             }
         } else {
             let item = entry.get_item(false).unwrap();
@@ -280,6 +287,7 @@ impl ZimEntry {
                         mime::APPLICATION_OCTET_STREAM
                     }),
                 ),
+                is_main_entry,
             }
         })
     }
@@ -297,6 +305,10 @@ impl waj::create::EntryTrait for ZimEntry {
 
     fn name(&self) -> &OsStr {
         &self.path
+    }
+
+    fn is_main_entry(&self) -> bool {
+        self.is_main_entry
     }
 }
 
@@ -337,8 +349,7 @@ impl Converter {
         );
 
         let main_page = zim.get_mainentry().unwrap();
-        let main_path = main_page.get_item(true).unwrap().get_path();
-        info!("Main page is {}", main_path);
+        let main_page_id = main_page.get_item(true).unwrap().get_index();
 
         let entry_store_creator = waj::create::EntryStoreCreator::new(main_path.into());
 
@@ -350,6 +361,7 @@ impl Converter {
             progress,
             tmp_path_content_pack,
             out_dir,
+            main_page_id,
         })
     }
 
@@ -470,7 +482,8 @@ impl Converter {
     fn handle(&mut self, entry: zim_rs::entry::Entry) -> jbk::Result<()> {
         self.progress.entries.inc(1);
 
-        let entry = ZimEntry::new(entry, &mut self.adder)?;
+        let is_main_entry = entry.get_index() == self.main_page_id;
+        let entry = ZimEntry::new(entry, is_main_entry, &mut self.adder)?;
         self.entry_store_creator.add_entry(&entry)
     }
 }
