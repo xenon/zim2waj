@@ -351,7 +351,7 @@ impl Converter {
         let main_page = zim.get_mainentry().unwrap();
         let main_page_id = main_page.get_item(true).unwrap().get_index();
 
-        let entry_store_creator = waj::create::EntryStoreCreator::new(main_path.into());
+        let entry_store_creator = waj::create::EntryStoreCreator::new(Some(zim.get_all_entrycount() as usize));
 
         Ok(Self {
             adder: ContentAdder::new(content_pack),
