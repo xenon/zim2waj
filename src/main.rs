@@ -57,8 +57,7 @@ impl ProgressBar {
             .filter("WAJ_LOG")
             .write_style("WAJ_LOG_STYLE");
         let logger = env_logger::Builder::from_env(env)
-            .format_module_path(false)
-            .format_timestamp(None)
+            .format_timestamp_millis()
             .build();
 
         let draw_target = indicatif::ProgressDrawTarget::stdout_with_hz(1);
@@ -226,7 +225,7 @@ pub struct Converter {
     tmp_path_content_pack: tempfile::TempPath,
     out_dir: PathBuf,
     progress: Arc<ProgressBar>,
-    main_page_id: u32,
+    has_main_page: bool,
 }
 
 enum ZimEntryKind {
@@ -237,26 +236,20 @@ enum ZimEntryKind {
 struct ZimEntry {
     path: OsString,
     data: ZimEntryKind,
-    is_main_entry: bool,
 }
 
 impl ZimEntry {
-    pub fn new<O>(
-        entry: zim_rs::entry::Entry,
-        is_main_entry: bool,
-        adder: &mut ContentAdder<O>,
-    ) -> jbk::Result<Self>
+    pub fn new<O>(entry: zim_rs::entry::Entry, adder: &mut ContentAdder<O>) -> jbk::Result<Self>
     where
         O: OutStream + 'static,
     {
         let path = entry.get_path();
         let path = path.strip_prefix('/').unwrap_or(&path);
         Ok(if entry.is_redirect() {
-            Self {
-                path: path.into(),
-                data: ZimEntryKind::Redirect(entry.get_redirect_entry().unwrap().get_path().into()),
-                is_main_entry,
-            }
+            Self::new_redirect(
+                path.into(),
+                entry.get_redirect_entry().unwrap().get_path().into(),
+            )
         } else {
             let item = entry.get_item(false).unwrap();
             let item_mimetype = item.get_mimetype().unwrap();
@@ -287,9 +280,14 @@ impl ZimEntry {
                         mime::APPLICATION_OCTET_STREAM
                     }),
                 ),
-                is_main_entry,
             }
         })
+    }
+    pub fn new_redirect(path: OsString, target: OsString) -> Self {
+        Self {
+            path,
+            data: ZimEntryKind::Redirect(target),
+        }
     }
 }
 
@@ -305,10 +303,6 @@ impl waj::create::EntryTrait for ZimEntry {
 
     fn name(&self) -> &OsStr {
         &self.path
-    }
-
-    fn is_main_entry(&self) -> bool {
-        self.is_main_entry
     }
 }
 
@@ -348,10 +342,8 @@ impl Converter {
             Default::default(),
         );
 
-        let main_page = zim.get_mainentry().unwrap();
-        let main_page_id = main_page.get_item(true).unwrap().get_index();
-
-        let entry_store_creator = waj::create::EntryStoreCreator::new(Some(zim.get_all_entrycount() as usize));
+        let entry_store_creator =
+            waj::create::EntryStoreCreator::new(Some(zim.get_all_entrycount() as usize));
 
         Ok(Self {
             adder: ContentAdder::new(content_pack),
@@ -361,7 +353,7 @@ impl Converter {
             progress,
             tmp_path_content_pack,
             out_dir,
-            main_page_id,
+            has_main_page: false,
         })
     }
 
@@ -476,14 +468,24 @@ impl Converter {
             .map(|e| e.unwrap())
             .filter(|e| filter(&e.get_path()))
             .try_for_each(|e| self.handle(e))?;
+
+        if !self.has_main_page {
+            let main_page = zim.get_mainentry().unwrap();
+            let main_page_path = main_page.get_item(true).unwrap().get_path();
+            let entry = ZimEntry::new_redirect("".into(), main_page_path.into());
+            self.entry_store_creator.add_entry(&entry)?;
+        }
+
         self.finalize(&outfile)
     }
 
     fn handle(&mut self, entry: zim_rs::entry::Entry) -> jbk::Result<()> {
         self.progress.entries.inc(1);
+        if entry.get_path().is_empty() {
+            self.has_main_page = true;
+        }
 
-        let is_main_entry = entry.get_index() == self.main_page_id;
-        let entry = ZimEntry::new(entry, is_main_entry, &mut self.adder)?;
+        let entry = ZimEntry::new(entry, &mut self.adder)?;
         self.entry_store_creator.add_entry(&entry)
     }
 }
