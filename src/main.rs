@@ -1,5 +1,3 @@
-use jubako as jbk;
-
 use clap::Parser;
 
 use indicatif_log_bridge::LogWrapper;
