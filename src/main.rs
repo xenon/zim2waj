@@ -5,8 +5,7 @@ use clap::Parser;
 use indicatif_log_bridge::LogWrapper;
 use jbk::creator::OutStream;
 use mime_guess::{mime, Mime};
-use std::ffi::OsStr;
-use std::ffi::OsString;
+use std::borrow::Cow;
 use std::io::{self, Read, Seek, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -29,8 +28,6 @@ struct Cli {
     #[clap(short, long, value_parser)]
     outfile: PathBuf,
 }
-
-const VENDOR_ID: u32 = 0x6a_69_6d_00;
 
 pub enum ConcatMode {
     OneFile,
@@ -229,12 +226,12 @@ pub struct Converter {
 }
 
 enum ZimEntryKind {
-    Redirect(OsString),
+    Redirect(String),
     Content(jbk::ContentAddress, Mime),
 }
 
 struct ZimEntry {
-    path: OsString,
+    path: String,
     data: ZimEntryKind,
 }
 
@@ -246,10 +243,7 @@ impl ZimEntry {
         let path = entry.get_path();
         let path = path.strip_prefix('/').unwrap_or(&path);
         Ok(if entry.is_redirect() {
-            Self::new_redirect(
-                path.into(),
-                entry.get_redirect_entry().unwrap().get_path().into(),
-            )
+            Self::new_redirect(path.into(), entry.get_redirect_entry().unwrap().get_path())
         } else {
             let item = entry.get_item(false).unwrap();
             let item_mimetype = item.get_mimetype().unwrap();
@@ -283,7 +277,7 @@ impl ZimEntry {
             }
         })
     }
-    pub fn new_redirect(path: OsString, target: OsString) -> Self {
+    pub fn new_redirect(path: String, target: String) -> Self {
         Self {
             path,
             data: ZimEntryKind::Redirect(target),
@@ -301,8 +295,8 @@ impl waj::create::EntryTrait for ZimEntry {
         }))
     }
 
-    fn name(&self) -> &OsStr {
-        &self.path
+    fn name(&self) -> Cow<str> {
+        Cow::Borrowed(&self.path)
     }
 }
 
@@ -330,7 +324,7 @@ impl Converter {
         let content_pack = jbk::creator::ContentPackCreator::new_from_output_with_progress(
             tmp_content_pack,
             jbk::PackId::from(1),
-            VENDOR_ID,
+            waj::VENDOR_ID,
             Default::default(),
             jbk::creator::Compression::zstd(),
             Arc::clone(&progress) as Arc<dyn jbk::creator::Progress>,
@@ -338,7 +332,7 @@ impl Converter {
 
         let directory_pack = jbk::creator::DirectoryPackCreator::new(
             jbk::PackId::from(0),
-            VENDOR_ID,
+            waj::VENDOR_ID,
             Default::default(),
         );
 
@@ -424,7 +418,7 @@ impl Converter {
         };
 
         let mut manifest_creator =
-            jbk::creator::ManifestPackCreator::new(VENDOR_ID, Default::default());
+            jbk::creator::ManifestPackCreator::new(waj::VENDOR_ID, Default::default());
 
         manifest_creator.add_pack(directory_pack_info, directory_locator);
         manifest_creator.add_pack(content_pack_info, content_locator);
@@ -472,7 +466,7 @@ impl Converter {
         if !self.has_main_page {
             let main_page = zim.get_mainentry().unwrap();
             let main_page_path = main_page.get_item(true).unwrap().get_path();
-            let entry = ZimEntry::new_redirect("".into(), main_page_path.into());
+            let entry = ZimEntry::new_redirect("".into(), main_page_path);
             self.entry_store_creator.add_entry(&entry)?;
         }
 
