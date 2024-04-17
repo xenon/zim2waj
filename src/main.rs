@@ -1,15 +1,12 @@
 use clap::Parser;
 
 use indicatif_log_bridge::LogWrapper;
-use jbk::creator::OutStream;
+use jbk::creator::{BasicCreator, ConcatMode};
 use mime_guess::{mime, Mime};
 use std::borrow::Cow;
-use std::io::{self, Read, Seek, Write};
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use waj::create::Adder;
 use zim_rs::archive::Archive;
 
 use log::info;
@@ -25,12 +22,6 @@ struct Cli {
     // Archive name to create
     #[clap(short, long, value_parser)]
     outfile: PathBuf,
-}
-
-pub enum ConcatMode {
-    OneFile,
-    TwoFiles,
-    NoConcat,
 }
 
 #[derive(Clone)]
@@ -142,83 +133,9 @@ impl jbk::creator::Progress for ProgressBar {
     }
 }
 
-pub struct ContentAdder<O: OutStream + 'static> {
-    content_pack: jbk::creator::ContentPackCreator<O>,
-}
-
-impl<O: OutStream + 'static> ContentAdder<O> {
-    fn new(content_pack: jbk::creator::ContentPackCreator<O>) -> Self {
-        Self { content_pack }
-    }
-
-    fn into_inner(self) -> jbk::creator::ContentPackCreator<O> {
-        self.content_pack
-    }
-}
-
-impl<O: OutStream + 'static> waj::create::Adder for ContentAdder<O> {
-    fn add<R: jbk::creator::InputReader>(&mut self, reader: R) -> jbk::Result<jbk::ContentAddress> {
-        let content_id = self.content_pack.add_content(reader)?;
-        Ok(jbk::ContentAddress::new(1.into(), content_id))
-    }
-}
-
-#[derive(Debug)]
-pub enum MaybeInContainer {
-    In(jbk::creator::InContainerFile),
-    No(std::fs::File),
-}
-
-impl OutStream for MaybeInContainer {
-    fn copy(&mut self, reader: Box<dyn jbk::creator::InputReader>) -> io::Result<u64> {
-        match self {
-            Self::In(f) => f.copy(reader),
-            Self::No(f) => f.copy(reader),
-        }
-    }
-}
-
-impl Seek for MaybeInContainer {
-    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-        match self {
-            Self::In(f) => f.seek(pos),
-            Self::No(f) => f.seek(pos),
-        }
-    }
-}
-
-impl Write for MaybeInContainer {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::In(f) => f.write(buf),
-            Self::No(f) => f.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::In(f) => f.flush(),
-            Self::No(f) => f.flush(),
-        }
-    }
-}
-
-impl Read for MaybeInContainer {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::In(f) => f.read(buf),
-            Self::No(f) => f.read(buf),
-        }
-    }
-}
-
 pub struct Converter {
-    adder: ContentAdder<MaybeInContainer>,
-    directory_pack: jbk::creator::DirectoryPackCreator,
-    entry_store_creator: waj::create::EntryStoreCreator,
-    concat_mode: ConcatMode,
-    tmp_path_content_pack: tempfile::TempPath,
-    out_dir: PathBuf,
+    basic_creator: BasicCreator,
+    entry_store_creator: Box<waj::create::EntryStoreCreator>,
     progress: Arc<ProgressBar>,
     has_main_page: bool,
 }
@@ -234,10 +151,7 @@ struct ZimEntry {
 }
 
 impl ZimEntry {
-    pub fn new<O>(entry: zim_rs::entry::Entry, adder: &mut ContentAdder<O>) -> jbk::Result<Self>
-    where
-        O: OutStream + 'static,
-    {
+    pub fn new(entry: zim_rs::entry::Entry, adder: &mut BasicCreator) -> jbk::Result<Self> {
         let path = entry.get_path();
         let path = path.strip_prefix('/').unwrap_or(&path);
         Ok(if entry.is_redirect() {
@@ -249,7 +163,7 @@ impl ZimEntry {
             let direct_access = item.get_direct_access().unwrap();
             let content_address = if direct_access.is_none() || item_size <= 4 * 1024 * 1024 {
                 let blob_reader = std::io::Cursor::new(item.get_data().unwrap());
-                adder.add(blob_reader)?
+                adder.add_content(blob_reader)?
             } else {
                 let direct_access = direct_access.unwrap();
                 let reader = jbk::creator::InputFile::new_range(
@@ -257,7 +171,7 @@ impl ZimEntry {
                     direct_access.get_offset(),
                     Some(item_size),
                 )?;
-                adder.add(reader)?
+                adder.add_content(reader)?
             };
             Self {
                 path: path.into(),
@@ -304,144 +218,29 @@ impl Converter {
         outfile: P,
         concat_mode: ConcatMode,
     ) -> jbk::Result<Self> {
-        let outfile = outfile.as_ref();
-        let out_dir = outfile.parent().unwrap().to_path_buf();
-
         let progress = Arc::new(ProgressBar::new(zim)?);
-
-        let (tmp_content_pack, tmp_path_content_pack) =
-            tempfile::NamedTempFile::new_in(&out_dir)?.into_parts();
-
-        let tmp_content_pack = if let ConcatMode::OneFile = concat_mode {
-            MaybeInContainer::In(
-                jbk::creator::ContainerPackCreator::from_file(tmp_content_pack)?.into_file()?,
-            )
-        } else {
-            MaybeInContainer::No(tmp_content_pack)
-        };
-        let content_pack = jbk::creator::ContentPackCreator::new_from_output_with_progress(
-            tmp_content_pack,
-            jbk::PackId::from(1),
+        let basic_creator = BasicCreator::new(
+            &outfile,
+            concat_mode,
             waj::VENDOR_ID,
-            Default::default(),
             jbk::creator::Compression::zstd(),
             Arc::clone(&progress) as Arc<dyn jbk::creator::Progress>,
         )?;
-
-        let directory_pack = jbk::creator::DirectoryPackCreator::new(
-            jbk::PackId::from(0),
-            waj::VENDOR_ID,
-            Default::default(),
-        );
-
-        let entry_store_creator =
-            waj::create::EntryStoreCreator::new(Some(zim.get_all_entrycount() as usize));
+        let entry_store_creator = Box::new(waj::create::EntryStoreCreator::new(Some(
+            zim.get_all_entrycount() as usize,
+        )));
 
         Ok(Self {
-            adder: ContentAdder::new(content_pack),
-            directory_pack,
+            basic_creator,
             entry_store_creator,
-            concat_mode,
             progress,
-            tmp_path_content_pack,
-            out_dir,
             has_main_page: false,
         })
     }
 
-    fn finalize(mut self, outfile: &Path) -> jbk::Result<()> {
-        self.entry_store_creator
-            .finalize(&mut self.directory_pack)?;
-
-        let (content_pack_file, content_pack_info) = self.adder.into_inner().finalize()?;
-
-        let (mut container, content_locator) = match self.concat_mode {
-            ConcatMode::OneFile => {
-                // Our content_pack_file IS the container pack
-                if let MaybeInContainer::In(tmp_file) = content_pack_file {
-                    let container = tmp_file.close(content_pack_info.uuid)?;
-                    if let Err(e) = self.tmp_path_content_pack.persist(outfile) {
-                        return Err(e.error.into());
-                    }
-                    (Some(container), vec![])
-                } else {
-                    panic!("content_pack_file should be a \"InContainer\"");
-                }
-            }
-            _ => {
-                // No concat of the content pack, so we have to persist it.
-                // But we may need to create our container for the directory pack
-                let mut outfilename = outfile.file_name().unwrap().to_os_string();
-                outfilename.push(".jbkc");
-                let mut content_pack_path = PathBuf::new();
-                content_pack_path.push(outfile);
-                content_pack_path.set_file_name(&outfilename);
-
-                if let Err(e) = self.tmp_path_content_pack.persist(&content_pack_path) {
-                    return Err(e.error.into());
-                }
-
-                let container = if let ConcatMode::TwoFiles = self.concat_mode {
-                    Some(jbk::creator::ContainerPackCreator::new(outfile)?)
-                } else {
-                    None
-                };
-                (container, outfilename.into_vec())
-            }
-        };
-
-        let (directory_pack_info, directory_locator) = match self.concat_mode {
-            ConcatMode::NoConcat => {
-                let (mut tmpfile, tmpname) =
-                    tempfile::NamedTempFile::new_in(&self.out_dir)?.into_parts();
-                let directory_pack_info = self.directory_pack.finalize(&mut tmpfile)?;
-
-                let mut outfilename = outfile.file_name().unwrap().to_os_string();
-                outfilename.push(".jbkd");
-                let mut directory_pack_path = PathBuf::new();
-                directory_pack_path.push(outfile);
-                directory_pack_path.set_file_name(&outfilename);
-
-                if let Err(e) = tmpname.persist(directory_pack_path) {
-                    return Err(e.error.into());
-                };
-                (directory_pack_info, outfilename.into_vec())
-            }
-            _ => {
-                let mut infile = container.unwrap().into_file()?;
-                let directory_pack_info = self.directory_pack.finalize(&mut infile)?;
-                container = Some(infile.close(directory_pack_info.uuid)?);
-                (directory_pack_info, vec![])
-            }
-        };
-
-        let mut manifest_creator =
-            jbk::creator::ManifestPackCreator::new(waj::VENDOR_ID, Default::default());
-
-        manifest_creator.add_pack(directory_pack_info, directory_locator);
-        manifest_creator.add_pack(content_pack_info, content_locator);
-
-        match self.concat_mode {
-            ConcatMode::NoConcat => {
-                let (mut tmpfile, tmpname) =
-                    tempfile::NamedTempFile::new_in(self.out_dir)?.into_parts();
-                manifest_creator.finalize(&mut tmpfile)?;
-
-                if let Err(e) = tmpname.persist(outfile) {
-                    return Err(e.error.into());
-                };
-            }
-            _ => {
-                let mut infile = container.unwrap().into_file()?;
-                let manifest_uuid = manifest_creator.finalize(&mut infile)?;
-                container = Some(infile.close(manifest_uuid)?);
-            }
-        };
-        if let Some(container) = container {
-            container.finalize()
-        } else {
-            Ok(())
-        }
+    fn finalize(self, outfile: &Path) -> jbk::Result<()> {
+        self.basic_creator
+            .finalize(outfile, self.entry_store_creator, vec![])
     }
 
     pub fn run(mut self, zim: &Archive, outfile: PathBuf) -> jbk::Result<()> {
@@ -477,7 +276,7 @@ impl Converter {
             self.has_main_page = true;
         }
 
-        let entry = ZimEntry::new(entry, &mut self.adder)?;
+        let entry = ZimEntry::new(entry, &mut self.basic_creator)?;
         self.entry_store_creator.add_entry(&entry)
     }
 }
