@@ -4,6 +4,9 @@ use dropout::Dropper;
 use indicatif_log_bridge::LogWrapper;
 use jbk::creator::{BasicCreator, CompHint, ConcatMode, InputReader};
 use mime_guess::{mime, Mime};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -256,6 +259,73 @@ impl From<zim_rs::item::Item> for Droppable {
     }
 }
 
+fn entry_producer(
+    zim: Arc<Archive>,
+    dropper: Dropper<Droppable>,
+) -> std::sync::mpsc::Receiver<zim_rs::entry::Entry> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(2048);
+
+    std::thread::spawn(move || {
+        let iter = zim.iter_efficient().unwrap();
+        let filter = if zim.has_new_namespace_scheme() {
+            |_p: &str| true
+        } else {
+            |p: &str| matches!(&p.as_bytes()[0], b'-' | b'A' | b'C' | b'J' | b'I')
+        };
+        let mut redirect_idx = vec![];
+        let mut entries_idx = iter
+            .into_iter()
+            .filter_map(|e| {
+                let e = e.unwrap();
+                let ret = if filter(&e.get_path()) {
+                    if e.is_redirect() {
+                        redirect_idx.push(e.get_index());
+                        None
+                    } else {
+                        Some(e.get_index())
+                    }
+                } else {
+                    None
+                };
+                dropper.dropout(e.into());
+                ret
+            })
+            .collect::<Vec<_>>();
+        entries_idx.reverse();
+
+        {
+            let tx = tx.clone();
+            let zim = zim.clone();
+            std::thread::spawn(move || {
+                let mut entries_chunks = entries_idx
+                    .par_chunks(entries_idx.len() / 128)
+                    .collect::<Vec<_>>();
+                entries_chunks.shuffle(&mut thread_rng());
+                entries_chunks.into_par_iter().for_each(|chunck| {
+                    chunck.iter().for_each(|i| {
+                        let entry = zim.get_entry_bypath_index(*i).unwrap();
+                        let item = entry.get_item(false).unwrap();
+                        let size = item.get_size();
+                        let blob = item.get_data_offset(size - 1, 1).unwrap();
+                        dropper.dropout(blob.into());
+                        dropper.dropout(item.into());
+                        tx.send(entry).unwrap();
+                    })
+                })
+            });
+        }
+
+        redirect_idx
+            .into_iter()
+            .map(|i| zim.get_entry_bypath_index(i).unwrap())
+            .for_each(|e| {
+                tx.send(e).unwrap();
+            });
+    });
+
+    rx
+}
+
 impl Converter {
     pub fn new<P: AsRef<Path>>(
         zim: &Archive,
@@ -288,25 +358,21 @@ impl Converter {
             .finalize(outfile, self.entry_store_creator, vec![])
     }
 
-    pub fn run(mut self, zim: &Archive, outfile: PathBuf) -> jbk::Result<()> {
+    pub fn run(mut self, zim: Arc<Archive>, outfile: PathBuf) -> jbk::Result<()> {
         info!(
             "Converting zim file with {} entries",
             zim.get_all_entrycount()
         );
 
-        let iter = zim.iter_efficient().unwrap();
-        let filter = if zim.has_new_namespace_scheme() {
-            |_p: &str| true
-        } else {
-            |p: &str| matches!(&p.as_bytes()[0], b'-' | b'A' | b'C' | b'J' | b'I')
-        };
-        iter.into_iter()
-            .map(|e| e.unwrap())
-            .filter(|e| filter(&e.get_path()))
-            .try_for_each(|e| self.handle(e))?;
+        let main_page = zim.get_mainentry().unwrap();
+
+        let entry_input = entry_producer(zim, self.dropper.clone());
+
+        while let Ok(e) = entry_input.recv() {
+            self.handle(e)?;
+        }
 
         if !self.has_main_page {
-            let main_page = zim.get_mainentry().unwrap();
             let main_page_path = main_page.get_item(true).unwrap().get_path();
             let entry = ZimEntry::new_redirect("".into(), main_page_path, true);
             self.entry_store_creator.add_entry(&entry)?;
@@ -329,7 +395,7 @@ impl Converter {
 fn main() -> jbk::Result<()> {
     let args = Cli::parse();
 
-    let zim = Archive::new(args.zim_file.to_str().unwrap()).unwrap();
+    let zim = Arc::new(Archive::new(args.zim_file.to_str().unwrap()).unwrap());
     let converter = Converter::new(&zim, &args.outfile, ConcatMode::OneFile)?;
-    converter.run(&zim, args.outfile)
+    converter.run(zim, args.outfile)
 }
