@@ -150,6 +150,7 @@ enum ZimEntryKind {
 struct ZimEntry {
     path: String,
     data: ZimEntryKind,
+    is_main: bool,
 }
 
 impl ZimEntry {
@@ -159,9 +160,14 @@ impl ZimEntry {
         adder: &mut BasicCreator,
     ) -> jbk::Result<Self> {
         let path = entry.get_path();
+        let is_main = path.is_empty();
         let path = path.strip_prefix('/').unwrap_or(&path);
         Ok(if entry.is_redirect() {
-            Self::new_redirect(path.into(), entry.get_redirect_entry().unwrap().get_path())
+            Self::new_redirect(
+                path.into(),
+                entry.get_redirect_entry().unwrap().get_path(),
+                is_main,
+            )
         } else {
             let item = entry.get_item(false).unwrap();
             dropper.dropout(entry.into());
@@ -199,13 +205,15 @@ impl ZimEntry {
                         mime::APPLICATION_OCTET_STREAM
                     }),
                 ),
+                is_main,
             }
         })
     }
-    pub fn new_redirect(path: String, target: String) -> Self {
+    pub fn new_redirect(path: String, target: String, is_main: bool) -> Self {
         Self {
             path,
             data: ZimEntryKind::Redirect(target),
+            is_main,
         }
     }
 }
@@ -300,7 +308,7 @@ impl Converter {
         if !self.has_main_page {
             let main_page = zim.get_mainentry().unwrap();
             let main_page_path = main_page.get_item(true).unwrap().get_path();
-            let entry = ZimEntry::new_redirect("".into(), main_page_path);
+            let entry = ZimEntry::new_redirect("".into(), main_page_path, true);
             self.entry_store_creator.add_entry(&entry)?;
         }
 
@@ -309,11 +317,11 @@ impl Converter {
 
     fn handle(&mut self, entry: zim_rs::entry::Entry) -> jbk::Result<()> {
         self.progress.entries.inc(1);
-        if entry.get_path().is_empty() {
-            self.has_main_page = true;
-        }
 
         let entry = ZimEntry::new(entry, &self.dropper, &mut self.basic_creator)?;
+        if entry.is_main {
+            self.has_main_page = true;
+        }
         self.entry_store_creator.add_entry(&entry)
     }
 }
