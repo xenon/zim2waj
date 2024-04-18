@@ -1066,6 +1066,7 @@ name = "zim2waj"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dropout",
  "env_logger",
  "indicatif",
  "indicatif-log-bridge",

@@ -1,5 +1,6 @@
 use clap::Parser;
 
+use dropout::Dropper;
 use indicatif_log_bridge::LogWrapper;
 use jbk::creator::{BasicCreator, CompHint, ConcatMode, InputReader};
 use mime_guess::{mime, Mime};
@@ -138,6 +139,7 @@ pub struct Converter {
     entry_store_creator: Box<waj::create::EntryStoreCreator>,
     progress: Arc<ProgressBar>,
     has_main_page: bool,
+    dropper: Dropper<Droppable>,
 }
 
 enum ZimEntryKind {
@@ -151,13 +153,18 @@ struct ZimEntry {
 }
 
 impl ZimEntry {
-    pub fn new(entry: zim_rs::entry::Entry, adder: &mut BasicCreator) -> jbk::Result<Self> {
+    pub fn new(
+        entry: zim_rs::entry::Entry,
+        dropper: &Dropper<Droppable>,
+        adder: &mut BasicCreator,
+    ) -> jbk::Result<Self> {
         let path = entry.get_path();
         let path = path.strip_prefix('/').unwrap_or(&path);
         Ok(if entry.is_redirect() {
             Self::new_redirect(path.into(), entry.get_redirect_entry().unwrap().get_path())
         } else {
             let item = entry.get_item(false).unwrap();
+            dropper.dropout(entry.into());
             let item_mimetype = item.get_mimetype().unwrap();
             let item_size = item.get_size();
             let direct_access = item.get_direct_access().unwrap();
@@ -178,6 +185,7 @@ impl ZimEntry {
                     )?)
                 };
             let content_address = adder.add_content(reader, comp_hint)?;
+            dropper.dropout(item.into());
             Self {
                 path: path.into(),
                 data: ZimEntryKind::Content(
@@ -217,6 +225,29 @@ impl waj::create::EntryTrait for ZimEntry {
     }
 }
 
+#[allow(dead_code)]
+enum Droppable {
+    Blob(zim_rs::blob::Blob),
+    Entry(zim_rs::entry::Entry),
+    Item(zim_rs::item::Item),
+}
+
+impl From<zim_rs::blob::Blob> for Droppable {
+    fn from(value: zim_rs::blob::Blob) -> Self {
+        Self::Blob(value)
+    }
+}
+impl From<zim_rs::entry::Entry> for Droppable {
+    fn from(value: zim_rs::entry::Entry) -> Self {
+        Self::Entry(value)
+    }
+}
+impl From<zim_rs::item::Item> for Droppable {
+    fn from(value: zim_rs::item::Item) -> Self {
+        Self::Item(value)
+    }
+}
+
 impl Converter {
     pub fn new<P: AsRef<Path>>(
         zim: &Archive,
@@ -240,6 +271,7 @@ impl Converter {
             entry_store_creator,
             progress,
             has_main_page: false,
+            dropper: Dropper::new(),
         })
     }
 
@@ -281,7 +313,7 @@ impl Converter {
             self.has_main_page = true;
         }
 
-        let entry = ZimEntry::new(entry, &mut self.basic_creator)?;
+        let entry = ZimEntry::new(entry, &self.dropper, &mut self.basic_creator)?;
         self.entry_store_creator.add_entry(&entry)
     }
 }
