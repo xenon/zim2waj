@@ -1,7 +1,7 @@
 use clap::Parser;
 
 use indicatif_log_bridge::LogWrapper;
-use jbk::creator::{BasicCreator, ConcatMode};
+use jbk::creator::{BasicCreator, CompHint, ConcatMode};
 use mime_guess::{mime, Mime};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -161,9 +161,14 @@ impl ZimEntry {
             let item_mimetype = item.get_mimetype().unwrap();
             let item_size = item.get_size();
             let direct_access = item.get_direct_access().unwrap();
+            let comp_hint = if direct_access.is_some() {
+                CompHint::No
+            } else {
+                CompHint::Yes
+            };
             let content_address = if direct_access.is_none() || item_size <= 4 * 1024 * 1024 {
                 let blob_reader = std::io::Cursor::new(item.get_data().unwrap());
-                adder.add_content(blob_reader)?
+                adder.add_content(blob_reader, comp_hint)?
             } else {
                 let direct_access = direct_access.unwrap();
                 let reader = jbk::creator::InputFile::new_range(
@@ -171,7 +176,7 @@ impl ZimEntry {
                     direct_access.get_offset(),
                     Some(item_size),
                 )?;
-                adder.add_content(reader)?
+                adder.add_content(reader, comp_hint)?
             };
             Self {
                 path: path.into(),
