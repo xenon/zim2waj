@@ -15,6 +15,17 @@ use zim_rs::archive::Archive;
 
 use log::info;
 
+#[inline(always)]
+fn spawn<F, T>(name: &'static str, f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(f)
+        .expect("Success to launch thread")
+}
 #[derive(Parser)]
 #[clap(name = "zim2waj")]
 #[clap(author, version, about, long_about=None)]
@@ -265,7 +276,7 @@ fn entry_producer(
 ) -> std::sync::mpsc::Receiver<zim_rs::entry::Entry> {
     let (tx, rx) = std::sync::mpsc::sync_channel(2048);
 
-    std::thread::spawn(move || {
+    spawn("entry producer", move || {
         let iter = zim.iter_efficient().unwrap();
         let filter = if zim.has_new_namespace_scheme() {
             |_p: &str| true
@@ -296,7 +307,7 @@ fn entry_producer(
         {
             let tx = tx.clone();
             let zim = zim.clone();
-            std::thread::spawn(move || {
+            spawn("Feeder", move || {
                 let mut entries_chunks = entries_idx
                     .par_chunks(entries_idx.len() / 128)
                     .collect::<Vec<_>>();
