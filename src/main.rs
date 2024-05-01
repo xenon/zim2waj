@@ -1,7 +1,7 @@
 use clap::Parser;
 
 use indicatif_log_bridge::LogWrapper;
-use jbk::creator::{BasicCreator, CompHint, ConcatMode};
+use jbk::creator::{BasicCreator, CompHint, ConcatMode, InputReader};
 use mime_guess::{mime, Mime};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -166,18 +166,18 @@ impl ZimEntry {
             } else {
                 CompHint::Yes
             };
-            let content_address = if direct_access.is_none() || item_size <= 4 * 1024 * 1024 {
-                let blob_reader = std::io::Cursor::new(item.get_data().unwrap());
-                adder.add_content(blob_reader, comp_hint)?
-            } else {
-                let direct_access = direct_access.unwrap();
-                let reader = jbk::creator::InputFile::new_range(
-                    std::fs::File::open(direct_access.get_path())?,
-                    direct_access.get_offset(),
-                    Some(item_size),
-                )?;
-                adder.add_content(reader, comp_hint)?
-            };
+            let reader: Box<dyn InputReader> =
+                if direct_access.is_none() || item_size <= 4 * 1024 * 1024 {
+                    Box::new(std::io::Cursor::new(item.get_data().unwrap()))
+                } else {
+                    let direct_access = direct_access.unwrap();
+                    Box::new(jbk::creator::InputFile::new_range(
+                        std::fs::File::open(direct_access.get_path())?,
+                        direct_access.get_offset(),
+                        Some(item_size),
+                    )?)
+                };
+            let content_address = adder.add_content(reader, comp_hint)?;
             Self {
                 path: path.into(),
                 data: ZimEntryKind::Content(
